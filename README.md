@@ -80,6 +80,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/jobs/{job_id}/series/{series_instance_uid}/kvp` | 按**匿名 SeriesInstanceUID** 统计 CT 管电压（KVP）逐帧分布：各电压帧数、缺失帧数与按匿名 SOP UID 排列的逐实例明细，便于发现同系列混用扫描参数 |
 | `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/preview.png` | 按**匿名 SOPInstanceUID** 返回实例影像的 8 位灰度 **PNG 预览**（未压缩、单帧、8/16 位 MONOCHROME1/2），供人工核对影像内容 |
 | `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/dose-events` | 按**匿名 SOPInstanceUID** 解析 **X-Ray Radiation Dose SR**：递归遍历 ContentSequence，按 DCM 编码的 CT 照射事件容器提取逐事件 CTDIvol（mGy）/ DLP（mGy·cm）并给出事件 DLP 合计；事件数据缺项/重复/非法/单位不符返回 `409` |
+| `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/seg-coverage` | 按**匿名 SOPInstanceUID** 统计未压缩 **BINARY SEG**（Segmentation Storage）的 **1-bit 掩码覆盖率**：逐帧用 PerFrameFunctionalGroupsSequence 的段号与 DerivationImageSequence/SourceImageSequence 匿名源 UID 关联任务内唯一成功输出源图像，同源同段多帧逐像素取并集后给出前景像素数/图像像素数/覆盖率 |
 | `GET` | `/health` | 健康检查 |
 
 ### 表单参数（`POST /jobs`）
@@ -731,6 +732,160 @@ else:
     print("事件 DLP 合计：", d["total_dlp_mgy_cm"], "mGy·cm")
 ```
 
+### SEG 分割掩码覆盖率（`GET /jobs/{job_id}/instances/{sop_instance_uid}/seg-coverage`）
+
+导入分割结果前，如需核对某个 **SEG（Segmentation Storage，模态 `SEG`）** 实例中
+各段相对其源图像的覆盖比例，可按**匿名 SOPInstanceUID** 取回覆盖率统计。数据**只来自
+已完成任务 output 目录中的匿名 DICOM 文件**，不重新解压或处理原始 ZIP；SEG 帧内
+源图像引用已在匿名化时随全序列 UID 映射一致重写，因此直接与任务内匿名输出对齐。
+
+`sop_instance_uid` 必须是任务结果中的**匿名后** SEG SOP UID，取自 `GET /jobs/{id}`
+响应里 `files[].sop_instance_uid`（成功文件的 `output_name` 去掉 `.dcm` 也是它）。
+
+**支持范围**（范围外或数据损坏一律 `409`，不返回部分统计）：
+
+* `SOPClassUID = 1.2.840.10008.5.1.4.1.1.66.4`（Segmentation Storage）；
+* 未压缩 native 传输语法：Implicit VR Little Endian、Explicit VR Little Endian、
+  Explicit VR Big Endian；JPEG / JPEG-LS / JPEG 2000 / RLE 等封装语法与
+  Deflated Explicit VR 一律拒绝；
+* `SegmentationType=BINARY`、`BitsAllocated=1`、`SamplesPerPixel=1`、
+  `PhotometricInterpretation=MONOCHROME2`、`PixelRepresentation=0`
+  （FRACTIONAL 等非 1-bit 分割拒绝）。
+
+**逐帧关联与解码规则**：
+
+1. 每帧在 `PerFrameFunctionalGroupsSequence[i].SegmentIdentificationSequence[0]
+   .ReferencedSegmentNumber` 取得**段号**；段号缺失/非法/不在 `SegmentSequence`
+   中均为冲突；
+2. 同一逐帧功能组项内，源图像取自
+   `DerivationImageSequence[*].SourceImageSequence[*].ReferencedSOPInstanceUID`
+   （无 `DerivationImageSequence` 时读取功能组项上直接挂载的
+   `SourceImageSequence`）；源 UID 必须在**本任务的成功输出**中定位到**唯一**
+   成功输出图像；无源引用、同一帧引用多个**不同**源 UID、源不在任务输出中或源输出
+   歧义（同一匿名 UID 对应多份物理文件）均为冲突；
+3. 1-bit 掩码按 **DICOM PS3.5 §8.1.1** 解码：每像素 1 bit、**最高位（MSB）对应行内
+   最左像素**、每行末向字节边界补零；`NumberOfFrames`、
+   `PerFrameFunctionalGroupsSequence` 条目数与 `PixelData` 字节长度必须互洽；
+4. 以**（匿名源 SOPInstanceUID, 段号）**分组，组内多帧掩码**逐像素取并集**
+   （前景=值 1）；图像像素数取**源图像** `Rows × Columns`，源尺寸与 SEG 帧
+   `Rows/Columns` 不一致即为冲突；
+5. `coverage_ratio = foreground_pixel_count / image_pixel_count`，结果按源 UID、
+   段号升序排列。
+
+成功响应（200）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `sop_instance_uid` / `output_file` | 请求的匿名 SEG SOPInstanceUID / 被统计的扁平输出文件名 |
+| `rows` / `columns` / `number_of_frames` | SEG 帧尺寸（所有关联源图像尺寸必须与之相同）与帧数 |
+| `item_count` | 按 (源 UID, 段号) 分组后的统计条数 |
+| `items[].source_sop_instance_uid` | 该组帧引用的**匿名源** SOPInstanceUID（任务内唯一成功输出） |
+| `items[].segment_number` | 段号（`SegmentSequence` 内的 `SegmentNumber`） |
+| `items[].frame_count` | 引用该源与该段的 SEG 帧数（并集前） |
+| `items[].foreground_pixel_count` | 组内多帧掩码逐像素并集后的前景像素数 |
+| `items[].image_pixel_count` | 源图像像素数（源 `Rows × Columns`） |
+| `items[].coverage_ratio` | 覆盖率，区间 `[0.0, 1.0]` |
+
+```bash
+# 10) 取某个 SEG 的匿名 SOPInstanceUID（示例取文件名为 seg.dcm 的成功输出），
+#     统计各源图像各段的掩码覆盖率（默认端口 8000）
+SEG_UID=$(python3 -c "
+import json
+job=json.load(open('job.json'))
+print(next(f['sop_instance_uid'] for f in job['files'] if f['output_name']))")
+
+curl -f "http://localhost:8000/jobs/$JOB_ID/instances/$SEG_UID/seg-coverage" | python3 -m json.tool
+```
+
+```jsonc
+{
+  "sop_instance_uid": "2.25.4212…",
+  "output_file": "2.25.4212….dcm",
+  "rows": 4,
+  "columns": 8,
+  "number_of_frames": 4,
+  "item_count": 3,
+  "items": [
+    {"source_sop_instance_uid": "2.25.2706…", "segment_number": 1,
+     "frame_count": 2, "foreground_pixel_count": 3,
+     "image_pixel_count": 32, "coverage_ratio": 0.09375},   // 两帧重叠 1 px：并集 3 px
+    {"source_sop_instance_uid": "2.25.2706…", "segment_number": 2,
+     "frame_count": 1, "foreground_pixel_count": 1,
+     "image_pixel_count": 32, "coverage_ratio": 0.03125},
+    {"source_sop_instance_uid": "2.25.9487…", "segment_number": 1,
+     "frame_count": 1, "foreground_pixel_count": 1,
+     "image_pixel_count": 32, "coverage_ratio": 0.03125}
+  ]
+}
+```
+
+出现以下任一情况时接口**不给出任何部分统计**，而是返回 `409`
+（`detail.code = SEG_COVERAGE_CONFLICT`），在 `detail.problems[]` 中
+**一次性列出全部问题**，帧级问题带 `frame_index` / `segment_number`，
+源级问题带 `source_sop_instance_uid`，且**只回显匿名 UID**：
+
+| `reason` | 触发条件 |
+| --- | --- |
+| `unreadable` | 匿名 SEG 输出不可读（损坏 / 截断 / 编码错误） |
+| `sop_instance_uid_mismatch` | 文件内 SOPInstanceUID 与请求的匿名 UID 不一致 |
+| `not_segmentation` | 不是 Segmentation Storage（`sop_class_uid` 给出实际值） |
+| `unsupported_transfer_syntax` | 压缩 / Deflated 等非 native 传输语法（回传 `transfer_syntax_uid`） |
+| `unsupported_segmentation_type` | `SegmentationType` 缺失或不为 `BINARY`（回传 `segmentation_type`） |
+| `missing_pixel_data` | SEG 不包含非空 PixelData |
+| `invalid_pixel_metadata` | `SamplesPerPixel`/`PhotometricInterpretation`/`BitsAllocated`/`PixelRepresentation`/`Rows`/`Columns`/`NumberOfFrames`/`SegmentSequence` 非法或段号重复 |
+| `frame_functional_groups_missing` | 缺少 `PerFrameFunctionalGroupsSequence` |
+| `frame_count_mismatch` | `NumberOfFrames` 与逐帧功能组条目数不一致 |
+| `invalid_pixel_data_length` | PixelData 字节数与声明帧尺寸不符（给出实际/期望字节数） |
+| `missing_segment_number` / `invalid_segment_number` | 帧缺段号，或段号无法解析为唯一正整数 |
+| `unknown_segment_number` | 帧引用的段号不在 `SegmentSequence` 中 |
+| `missing_source_reference` | 帧无源引用序列，或引用序列中没有 ReferencedSOPInstanceUID |
+| `ambiguous_source_reference` | 同一帧引用多个**不同**源 SOP UID（`referenced_sop_instance_uids` 给出全部匿名 UID） |
+| `source_not_in_output` | 源 SOP UID 不在本任务成功输出中 |
+| `ambiguous_source_output` | 源 SOP UID 对应多份输出文件（`output_files` 列出冲突文件） |
+| `source_output_missing` / `source_unreadable` | 源输出文件被清理，或源输出不是可读 DICOM |
+| `source_dimension_mismatch` | 源图像 `Rows/Columns` 缺失，或与 SEG 帧尺寸不一致（给出双方行列数） |
+
+其余错误（`detail.code` 机器可读）：
+
+| 状态码 | `detail.code` | 触发条件 |
+| --- | --- | --- |
+| `404` | `JOB_NOT_FOUND` | 任务 ID 不存在或已过期 |
+| `404` | `INSTANCE_NOT_FOUND` | 该匿名 SOPInstanceUID 不在任务的成功输出中 |
+| `404` | `INSTANCE_OUTPUT_MISSING` | 任务记录有该输出但磁盘文件已不存在（`reason=output_missing`） |
+| `409` | `JOB_NOT_READY` | 任务 `status != ready`（匿名化处理失败） |
+| `409` | `AMBIGUOUS_INSTANCE_OUTPUT` | 同一匿名 SEG SOP UID 对应多份输出文件（`reason=ambiguous_output`，`output_files` 列出冲突文件） |
+
+Python 示例（含 404/409 处理）：
+
+```python
+resp = requests.get(
+    f"http://localhost:8000/jobs/{job_id}/instances/{anon_seg_uid}/seg-coverage"
+)
+if resp.status_code == 404:
+    print("任务或匿名 SEG 实例不存在：", resp.json()["detail"]["code"])
+elif resp.status_code == 409:
+    detail = resp.json()["detail"]
+    print("无法统计覆盖率：", detail["code"])
+    for p in detail.get("problems", []):
+        # reason: not_segmentation | unsupported_transfer_syntax |
+        #         unsupported_segmentation_type | missing_pixel_data |
+        #         invalid_pixel_metadata | frame_count_mismatch |
+        #         invalid_pixel_data_length | missing_segment_number |
+        #         unknown_segment_number | missing_source_reference |
+        #         ambiguous_source_reference | source_not_in_output |
+        #         ambiguous_source_output | source_output_missing |
+        #         source_unreadable | source_dimension_mismatch | …
+        print("帧", p.get("frame_index"), "段", p.get("segment_number"),
+              p["reason"], p.get("source_sop_instance_uid"))
+else:
+    resp.raise_for_status()
+    cov = resp.json()
+    for item in cov["items"]:
+        print(item["source_sop_instance_uid"], "段", item["segment_number"],
+              f"{item['foreground_pixel_count']}/{item['image_pixel_count']}",
+              f"{item['coverage_ratio']:.2%}")
+```
+
 ### 跨任务合并下载同一匿名检查（`POST /jobs/merged-study/download`）
 
 当同一个检查的实例被拆到**多个批次 ZIP** 上传时（只要使用**同一把稳定密钥**，
@@ -1269,10 +1424,11 @@ else:
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、系列几何、系列 KVP 分布、实例 PNG 预览、剂量 SR 照射事件、/health）
+│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、系列几何、系列 KVP 分布、实例 PNG 预览、剂量 SR 照射事件、SEG 掩码覆盖率、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
 │   ├── preview.py       # 按匿名 SOP UID 从成功输出渲染单帧 8 位灰度 PNG：Rescale→VOI 窗/极值拉伸→MONOCHROME1 反相
 │   ├── dose_events.py   # 按匿名 SOP UID 解析 X-Ray Radiation Dose SR：CT 照射事件容器边界、逐事件 CTDIvol/DLP 与事件 DLP 合计
+│   ├── seg_coverage.py  # 按匿名 SOP UID 统计未压缩 BINARY SEG 的 1-bit 掩码覆盖率：逐帧段号/源图像关联、MSB-first 解码、同源同段多帧并集
 │   ├── dicomdir.py      # 从匿名输出重建 DICOMDIR 四级层级、稳定短 File ID、引用校验与阅片 ZIP
 │   ├── geometry.py      # 系列单帧切片几何：方向余弦叉积法线、投影排序、中位数层间距与 >1.5× 缺口标记
 │   ├── kvp.py           # 系列 CT 管电压逐帧分布：逐帧/共享功能组/顶层三级回退、各电压帧数与缺失帧数统计
@@ -1283,9 +1439,9 @@ else:
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何/KVP/剂量事件错误模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何/KVP/剂量事件/SEG 覆盖率错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件（265 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 掩码覆盖率（311 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

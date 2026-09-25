@@ -21,6 +21,7 @@ from . import (
     merged_study,
     pagination,
     preview,
+    seg_coverage,
     study_subset,
 )
 from .config import settings
@@ -42,6 +43,8 @@ from .schemas import (
     MergedStudyErrorDetail,
     PatientOut,
     PreviewErrorDetail,
+    SegCoverageErrorDetail,
+    SegCoverageOut,
     SeriesGeometryOut,
     SeriesKvpOut,
     SeriesOut,
@@ -71,6 +74,8 @@ app = FastAPI(
         "按匿名 SeriesInstanceUID 统计 CT 管电压（KVP）逐帧分布以发现混用扫描参数，"
         "按匿名 SOPInstanceUID 解析 X-Ray Radiation Dose SR 的 CT 照射事件剂量"
         "（CTDIvol/DLP 与事件 DLP 合计），"
+        "按匿名 SOPInstanceUID 统计未压缩 BINARY SEG 的 1-bit 掩码"
+        "对任务内唯一成功输出源图像的逐段覆盖率（多帧取并集），"
         "并支持对多个已完成任务做跨批次密钥指纹/伪名/UID 映射一致性核对。"
     ),
     lifespan=lifespan,
@@ -789,6 +794,56 @@ def get_instance_dose_events(job_id: str, sop_instance_uid: str) -> DoseEventsOu
 
 
 @app.get(
+    "/jobs/{job_id}/instances/{sop_instance_uid}/seg-coverage",
+    response_model=SegCoverageOut,
+    tags=["jobs"],
+    summary=(
+        "按匿名 SOPInstanceUID 统计未压缩 BINARY SEG 的 1-bit 掩码覆盖率："
+        "逐帧关联唯一成功输出源图像与段号，同源同段多帧取并集"
+    ),
+    responses={
+        404: {"model": SegCoverageErrorDetail,
+              "description": "任务不存在/已过期，该匿名 SOP UID 不在任务的成功输出中，"
+                             "或匿名输出文件已不存在"},
+        409: {"model": SegCoverageErrorDetail,
+              "description": "任务未完成、同一匿名 SOP UID 对应多份输出，或 SEG 统计冲突："
+                             "非 Segmentation Storage / 压缩或非 BINARY / 像素元数据非法 / "
+                             "帧数或 PixelData 异常 / 段号或源引用缺失歧义 / "
+                             "源输出缺失不可读 / 源尺寸与掩码不一致（不返回部分统计）"},
+    },
+)
+def get_instance_seg_coverage(job_id: str, sop_instance_uid: str) -> SegCoverageOut:
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": "任务不存在或已过期",
+                "sop_instance_uid": sop_instance_uid,
+            },
+        )
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOB_NOT_READY",
+                "message": f"任务处理失败：{job.error}",
+                "sop_instance_uid": sop_instance_uid,
+            },
+        )
+
+    try:
+        report = seg_coverage.analyze_seg_coverage(job, sop_instance_uid)
+    except seg_coverage.SegCoverageError as exc:
+        raise HTTPException(
+            status_code=exc.http_status, detail=exc.detail
+        ) from exc
+
+    return SegCoverageOut.model_validate(report)
+
+
+@app.get(
     "/jobs/{job_id}/dicomdir/download",
     tags=["jobs"],
     summary="下载带 DICOMDIR 的离线阅片 ZIP（按匿名伪名/UID 重建患者-检查-系列-实例层级）",
@@ -852,6 +907,7 @@ def root() -> dict:
             "GET /jobs/{job_id}/series/{series_instance_uid}/kvp",
             "GET /jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
             "GET /jobs/{job_id}/instances/{sop_instance_uid}/dose-events",
+            "GET /jobs/{job_id}/instances/{sop_instance_uid}/seg-coverage",
             "GET /health",
         ],
     }

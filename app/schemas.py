@@ -745,6 +745,142 @@ class DoseEventsErrorDetail(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# SEG 分割掩码覆盖率（GET /jobs/{id}/instances/{uid}/seg-coverage）
+# --------------------------------------------------------------------------- #
+class SegCoverageItem(BaseModel):
+    source_sop_instance_uid: str = Field(
+        description="该组掩码帧引用的匿名源 SOPInstanceUID（任务内唯一成功输出）"
+    )
+    segment_number: int = Field(description="段号（SegmentSequence 内的 SegmentNumber）")
+    frame_count: int = Field(
+        description="引用该源图像与段号的 SEG 帧数（并集前的帧数）"
+    )
+    foreground_pixel_count: int = Field(
+        description="组内多帧掩码逐像素取并集后的前景（值 1）像素数"
+    )
+    image_pixel_count: int = Field(
+        description="源图像像素数（源 Rows × Columns，与掩码尺寸一致）"
+    )
+    coverage_ratio: float = Field(
+        description="覆盖率 = foreground_pixel_count / image_pixel_count，[0.0, 1.0]"
+    )
+
+
+class SegCoverageOut(BaseModel):
+    sop_instance_uid: str = Field(description="请求的匿名 SEG SOPInstanceUID")
+    output_file: Optional[str] = Field(
+        default=None, description="任务 output 目录内的扁平文件名"
+    )
+    rows: int = Field(description="SEG 掩码（及全部关联源图像）的行数")
+    columns: int = Field(description="SEG 掩码（及全部关联源图像）的列数")
+    number_of_frames: int = Field(description="SEG 帧数（NumberOfFrames）")
+    item_count: int = Field(description="按 (源 UID, 段号) 分组后的统计条数")
+    items: list[SegCoverageItem] = Field(
+        description="逐 (源 SOPInstanceUID, 段号) 的覆盖率，按源 UID、段号升序排列"
+    )
+
+
+class SegCoverageProblemItem(BaseModel):
+    sop_instance_uid: str = Field(description="被统计的匿名 SEG SOPInstanceUID")
+    output_file: Optional[str] = Field(
+        default=None, description="任务 output 目录内的扁平文件名"
+    )
+    frame_index: Optional[int] = Field(
+        default=None, description="帧级问题对应的 0 基帧序号；SEG 文件级问题为 null"
+    )
+    segment_number: Optional[int] = Field(
+        default=None, description="可确定时给出该帧引用的段号"
+    )
+    source_sop_instance_uid: Optional[str] = Field(
+        default=None, description="源图像类问题给出匿名源 SOPInstanceUID"
+    )
+    reason: str = Field(
+        description=(
+            "unreadable | sop_instance_uid_mismatch | not_segmentation | "
+            "unsupported_transfer_syntax | unsupported_segmentation_type | "
+            "missing_pixel_data | invalid_pixel_metadata | "
+            "frame_functional_groups_missing | frame_count_mismatch | "
+            "invalid_pixel_data_length | missing_segment_number | "
+            "invalid_segment_number | unknown_segment_number | "
+            "missing_source_reference | ambiguous_source_reference | "
+            "source_not_in_output | ambiguous_source_output | "
+            "source_output_missing | source_unreadable | source_dimension_mismatch"
+        )
+    )
+    message: str
+    referenced_sop_instance_uids: list[str] = Field(
+        default=[],
+        description="reason=ambiguous_source_reference 时给出该帧引用的全部匿名源 UID",
+    )
+    output_files: list[str] = Field(
+        default=[],
+        description="reason=ambiguous_source_output 时给出相互冲突的源输出文件名",
+    )
+    declared_number_of_frames: Optional[str] = Field(
+        default=None, description="帧数类问题给出 NumberOfFrames 原文"
+    )
+    per_frame_item_count: Optional[int] = Field(
+        default=None,
+        description="frame_count_mismatch 时 PerFrameFunctionalGroupsSequence 条目数",
+    )
+    transfer_syntax_uid: Optional[str] = Field(
+        default=None, description="unsupported_transfer_syntax 时回传实际传输语法 UID"
+    )
+    segmentation_type: Optional[str] = Field(
+        default=None, description="unsupported_segmentation_type 时回传实际类型"
+    )
+    pixel_data_length: Optional[int] = Field(
+        default=None, description="invalid_pixel_data_length 时的实际 PixelData 字节数"
+    )
+    expected_pixel_data_length: Optional[int] = Field(
+        default=None, description="invalid_pixel_data_length 时按帧尺寸期望的字节数"
+    )
+    source_rows: Optional[int] = Field(
+        default=None, description="source_dimension_mismatch 时源图像行数"
+    )
+    source_columns: Optional[int] = Field(
+        default=None, description="source_dimension_mismatch 时源图像列数"
+    )
+    seg_rows: Optional[int] = Field(
+        default=None, description="source_dimension_mismatch 时 SEG 掩码行数"
+    )
+    seg_columns: Optional[int] = Field(
+        default=None, description="source_dimension_mismatch 时 SEG 掩码列数"
+    )
+    segment_index: Optional[int] = Field(
+        default=None, description="SegmentSequence 段定义问题的条目序号"
+    )
+    sop_class_uid: Optional[str] = Field(
+        default=None, description="not_segmentation 时文件中的实际 SOPClassUID"
+    )
+
+
+class SegCoverageErrorDetail(BaseModel):
+    code: str = Field(
+        description="JOB_NOT_FOUND（404） | INSTANCE_NOT_FOUND（404） | "
+        "INSTANCE_OUTPUT_MISSING（404） | JOB_NOT_READY（409） | "
+        "AMBIGUOUS_INSTANCE_OUTPUT（409） | SEG_COVERAGE_CONFLICT（409）"
+    )
+    message: str
+    sop_instance_uid: Optional[str] = None
+    reason: Optional[str] = Field(
+        default=None,
+        description="INSTANCE_OUTPUT_MISSING 时为 output_missing；"
+        "AMBIGUOUS_INSTANCE_OUTPUT 时为 ambiguous_output",
+    )
+    output_file: Optional[str] = Field(
+        default=None, description="可定位时给出任务 output 目录内的扁平文件名"
+    )
+    output_files: list[str] = Field(
+        default=[], description="reason=ambiguous_output 时给出相互冲突的输出文件名"
+    )
+    conflict_count: Optional[int] = Field(
+        default=None, description="SEG_COVERAGE_CONFLICT 时的问题明细条数"
+    )
+    problems: list[SegCoverageProblemItem] = []
+
+
+# --------------------------------------------------------------------------- #
 # 跨任务合并下载单个匿名检查（POST /jobs/merged-study/download）
 # --------------------------------------------------------------------------- #
 class MergedStudyDownloadRequest(BaseModel):
